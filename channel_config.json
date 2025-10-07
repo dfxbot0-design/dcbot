@@ -1,0 +1,32 @@
+{
+    "channels": {
+        "1424255298482344039": {
+            "active": true,
+            "send_dm": false,
+            "loop_active": false
+        },
+        "1424427902312775690": {
+            "active": true,
+            "send_dm": true
+        },
+        "1424279918631583828": {
+            "active": true,
+            "send_dm": true
+        },
+        "1424407364144070717": {
+            "active": true,
+            "send_dm": true,
+            "loop_active": true
+        },
+        "1424306215181357150": {
+            "active": true,
+            "send_dm": true
+        }
+    },
+    "categories": {
+        "1424275707059507363": {
+            "active": true,
+            "send_dm": true
+        }
+    }
+}
