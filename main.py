@@ -38,11 +38,6 @@ def save_channel_config(config_data):
         json.dump(config_data, f, indent=4, ensure_ascii=False)
 
 # ------------------------------
-# MESAJ TAKİP SETİ
-# ------------------------------
-active_messages = set()
-
-# ------------------------------
 # DEEPL ÇEVİRİ FONKSİYONU
 # ------------------------------
 def translate_text(text, target_lang):
@@ -70,10 +65,15 @@ intents.members = True
 bot = commands.Bot(command_prefix="-", intents=intents, help_command=None)
 
 # ------------------------------
-# GPT İLE ÇEVİRİ
+# GPT ile çeviriyi iyileştirme
 # ------------------------------
 async def translate_with_gpt(text, target_lang):
+    """
+    DeepL çevirisi sonrası veya direkt olarak GPT üzerinden çeviri sağlar.
+    """
+    # GPT prompt
     prompt = f"Lütfen aşağıdaki metni sadece {target_lang} diline çevir. Hiçbir yorum ekleme. Ancak metinin çevirildiğinden emin ol. Merhaba gibi kısa mesajları, Hello haline getirirken çekinme. Argoları çevirirken çekinme.:\n{text}"
+
     try:
         response = openai.chat.completions.create(
             model="gpt-4o-mini",
@@ -83,43 +83,44 @@ async def translate_with_gpt(text, target_lang):
         gpt_result = response.choices[0].message.content
         return gpt_result
     except Exception as e:
-        # GPT başarısız olursa DeepL çevirisi
+        # Eğer GPT başarısız olursa, DeepL çevirisi
         return translate_text(text, target_lang)
 
 # ------------------------------
-# MESAJ VE REAKSİYON İŞLEME
+# Mesaj + Emoji + Kullanıcı bazlı aktif çeviri takibi
 # ------------------------------
-async def process_message_reactions(message, user, emoji_str):
+active_reactions = set()  # tuple: (message.id, emoji_str, user.id)
+
+async def process_message_reactions(message, user):
     if user.bot:
         return
 
-    if message.id in active_messages:
+    config_data = load_channel_config()
+    channel_id = str(message.channel.id)
+    category_id = str(message.channel.category_id) if message.channel.category else None
+
+    active = False
+    send_dm = False
+
+    if category_id and category_id in config_data.get("categories", {}):
+        cat_conf = config_data["categories"][category_id]
+        active = cat_conf["active"]
+        send_dm = cat_conf["send_dm"]
+
+    if channel_id in config_data.get("channels", {}):
+        chan_conf = config_data["channels"][channel_id]
+        active = chan_conf["active"]
+        send_dm = chan_conf["send_dm"]
+
+    if not active:
         return
-    active_messages.add(message.id)
 
-    try:
-        config_data = load_channel_config()
-        channel_id = str(message.channel.id)
-        category_id = str(message.channel.category_id) if message.channel.category else None
+    for reaction in message.reactions:
+        emoji_str = str(reaction.emoji)
+        key = (message.id, emoji_str, user.id)
 
-        active = False
-        send_dm = False
-
-        if category_id and category_id in config_data.get("categories", {}):
-            cat_conf = config_data["categories"][category_id]
-            active = cat_conf["active"]
-            send_dm = cat_conf["send_dm"]
-
-        if channel_id in config_data.get("channels", {}):
-            chan_conf = config_data["channels"][channel_id]
-            active = chan_conf["active"]
-            send_dm = chan_conf["send_dm"]
-
-        if not active:
-            return
-
-        # Sadece tıklanan emojiye tepki ver
-        if emoji_str in emoji_to_lang:
+        if emoji_str in emoji_to_lang and key not in active_reactions:
+            active_reactions.add(key)
             target_lang = emoji_to_lang[emoji_str]
             translated = await translate_with_gpt(message.content, target_lang)
 
@@ -129,28 +130,29 @@ async def process_message_reactions(message, user, emoji_str):
                 else:
                     reply_msg = await message.reply(translated)
 
-                # Emojiyi hemen kaldır
-                try:
-                    await message.remove_reaction(emoji_str, user)
-                except Exception as e:
-                    print(f"Emoji kaldırılamadı: {e}")
+                    # Emoji'yi hemen kaldır
+                    try:
+                        await message.remove_reaction(reaction.emoji, user)
+                    except Exception as e:
+                        print(f"Emoji kaldırılamadı: {e}")
 
-                # 60 saniye sonra çeviri mesajını sil
-                await asyncio.sleep(60)
-                try:
-                    await reply_msg.delete()
-                except:
-                    pass
+                    # Mesajı silme işlemini ayrı task olarak çalıştır
+                    async def delete_later(msg):
+                        await asyncio.sleep(60)
+                        try:
+                            await msg.delete()
+                        except:
+                            pass
 
-            except Exception as e:
-                await message.channel.send(f"{user.mention}, DM gönderilemedi: {e}")
+                    asyncio.create_task(delete_later(reply_msg))
 
-    finally:
-        if message.id in active_messages:
-            active_messages.remove(message.id)
+            except:
+                await message.channel.send(f"{user.mention}, DM gönderilemedi.")
+
+            active_reactions.remove(key)
 
 # ------------------------------
-# RAW REACTION EVENT
+# RAW REACTION EVENT (ESKİ VE YENİ MESAJLAR)
 # ------------------------------
 @bot.event
 async def on_raw_reaction_add(payload):
@@ -175,16 +177,16 @@ async def on_raw_reaction_add(payload):
     except:
         return
 
-    emoji_str = str(payload.emoji)
-    await process_message_reactions(message, user, emoji_str)
+    await process_message_reactions(message, user)
 
 # ------------------------------
-# KOMUTLAR: Kanal / Kategori
+# KOMUTLAR: Kanal / Kategori Ayarları
 # ------------------------------
 @bot.command()
 async def setchannel(ctx, channel: discord.TextChannel, active: str, send_dm: str):
     active_bool = active.lower() == "aktif"
     send_dm_bool = send_dm.lower() == "dm"
+
     config_data = load_channel_config()
     config_data["channels"][str(channel.id)] = {
         "active": active_bool,
@@ -197,6 +199,7 @@ async def setchannel(ctx, channel: discord.TextChannel, active: str, send_dm: st
 async def setcategory(ctx, category: discord.CategoryChannel, active: str, send_dm: str):
     active_bool = active.lower() == "aktif"
     send_dm_bool = send_dm.lower() == "dm"
+
     config_data = load_channel_config()
     config_data["categories"][str(category.id)] = {
         "active": active_bool,
