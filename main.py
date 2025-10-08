@@ -20,7 +20,19 @@ GPT_API_KEY = config["gpt_api_key"]
 
 openai.api_key = GPT_API_KEY
 
-# Emoji -> Dil eşlemesini JSON üzerinden yükle
+# ------------------------------
+# WHITELIST YÜKLEME
+# ------------------------------
+try:
+    with open("whitelist.json", "r", encoding="utf-8") as f:
+        whitelist = json.load(f)
+        OWNER_IDS = whitelist.get("owners", [])
+except FileNotFoundError:
+    OWNER_IDS = []
+
+# ------------------------------
+# EMOJI → DİL HARİTALAMA
+# ------------------------------
 with open("emoji_config.json", "r", encoding="utf-8") as f:
     emoji_to_lang = json.load(f)
 
@@ -36,6 +48,11 @@ def load_channel_config():
 def save_channel_config(config_data):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config_data, f, indent=4, ensure_ascii=False)
+
+# ------------------------------
+# MESAJ + EMOJI + USER KİLİT TAKİBİ
+# ------------------------------
+active_reactions = set()  # (message.id, emoji, user.id)
 
 # ------------------------------
 # DEEPL ÇEVİRİ FONKSİYONU
@@ -65,94 +82,124 @@ intents.members = True
 bot = commands.Bot(command_prefix="-", intents=intents, help_command=None)
 
 # ------------------------------
-# GPT ile çeviriyi iyileştirme
+# GLOBAL KOMUT KONTROLÜ (Whitelist)
+# ------------------------------
+@bot.check
+async def globally_block_dms_and_non_whitelisted(ctx):
+    if ctx.guild is None:
+        return False  # DM'den komut kullanılmasın
+    if ctx.author.id not in OWNER_IDS:
+        await ctx.send("🚫 Bu komutu kullanma yetkiniz yok.")
+        return False
+    return True
+
+# ------------------------------
+# GPT ÇEVİRİSİ (yedek olarak Deepl kullanır)
 # ------------------------------
 async def translate_with_gpt(text, target_lang):
-    """
-    DeepL çevirisi sonrası veya direkt olarak GPT üzerinden çeviri sağlar.
-    """
-    # GPT prompt
-    prompt = f"Lütfen aşağıdaki metni sadece {target_lang} diline çevir. Hiçbir yorum ekleme. Ancak metinin çevirildiğinden emin ol. Merhaba gibi kısa mesajları, Hello haline getirirken çekinme. Argoları çevirirken çekinme.:\n{text}"
-
+    prompt = (
+        f"Lütfen aşağıdaki metni yalnızca {target_lang} diline çevir. "
+        f"Yorum ekleme, sadece çeviriyi ver.\n\n"
+        f"{text}"
+    )
     try:
         response = openai.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7
         )
-        gpt_result = response.choices[0].message.content
-        return gpt_result
+        return response.choices[0].message.content
     except Exception as e:
-        # Eğer GPT başarısız olursa, DeepL çevirisi
+        logging.warning(f"GPT hata verdi, Deepl'e düşülüyor: {e}")
         return translate_text(text, target_lang)
 
 # ------------------------------
-# Mesaj + Emoji + Kullanıcı bazlı aktif çeviri takibi
+# MESAJ REAKSİYONLARINI İŞLEME
 # ------------------------------
-active_reactions = set()  # tuple: (message.id, emoji_str, user.id)
-
-async def process_message_reactions(message, user):
+async def process_message_reactions(message, user, emoji_str):
     if user.bot:
         return
 
-    config_data = load_channel_config()
-    channel_id = str(message.channel.id)
-    category_id = str(message.channel.category_id) if message.channel.category else None
-
-    active = False
-    send_dm = False
-
-    if category_id and category_id in config_data.get("categories", {}):
-        cat_conf = config_data["categories"][category_id]
-        active = cat_conf["active"]
-        send_dm = cat_conf["send_dm"]
-
-    if channel_id in config_data.get("channels", {}):
-        chan_conf = config_data["channels"][channel_id]
-        active = chan_conf["active"]
-        send_dm = chan_conf["send_dm"]
-
-    if not active:
+    key = (message.id, emoji_str, user.id)
+    if key in active_reactions:
         return
+    active_reactions.add(key)
 
-    for reaction in message.reactions:
-        emoji_str = str(reaction.emoji)
-        key = (message.id, emoji_str, user.id)
+    try:
+        config_data = load_channel_config()
+        channel_id = str(message.channel.id)
+        category_id = str(message.channel.category_id) if message.channel.category else None
 
-        if emoji_str in emoji_to_lang and key not in active_reactions:
-            active_reactions.add(key)
+        active = False
+        send_dm = False
+
+        # Kategori ayarları
+        if category_id and category_id in config_data.get("categories", {}):
+            cat_conf = config_data["categories"][category_id]
+            active = cat_conf["active"]
+            send_dm = cat_conf["send_dm"]
+
+        # Kanal ayarları
+        if channel_id in config_data.get("channels", {}):
+            chan_conf = config_data["channels"][channel_id]
+            active = chan_conf["active"]
+            send_dm = chan_conf["send_dm"]
+
+        if not active:
+            return
+
+        if emoji_str in emoji_to_lang:
             target_lang = emoji_to_lang[emoji_str]
             translated = await translate_with_gpt(message.content, target_lang)
 
-            try:
-                if send_dm:
+            if send_dm:
+                try:
                     await user.send(translated)
-                else:
+                except Exception as e:
+                    logging.warning(f"DM gönderilemedi: {e}")
+
+                # Kanal üzerindeki emojiyi kaldır
+                try:
+                    if message.guild:
+                        perms = message.channel.permissions_for(message.guild.me)
+                        if perms.manage_messages:
+                            await message.remove_reaction(emoji_str, user)
+                    else:
+                        await message.remove_reaction(emoji_str, user)
+                except Exception as e:
+                    logging.warning(f"Emoji kaldırılamadı (DM): {e}")
+
+            else:
+                try:
                     reply_msg = await message.reply(translated)
+                except Exception as e:
+                    logging.error(f"Çeviri gönderilemedi: {e}")
+                    return
 
-                    # Emoji'yi hemen kaldır
+                try:
+                    if message.guild:
+                        perms = message.channel.permissions_for(message.guild.me)
+                        if perms.manage_messages:
+                            await message.remove_reaction(emoji_str, user)
+                    else:
+                        await message.remove_reaction(emoji_str, user)
+                except Exception as e:
+                    logging.warning(f"Emoji kaldırılamadı (kanal): {e}")
+
+                async def delete_later(msg):
+                    await asyncio.sleep(60)
                     try:
-                        await message.remove_reaction(reaction.emoji, user)
-                    except Exception as e:
-                        print(f"Emoji kaldırılamadı: {e}")
+                        await msg.delete()
+                    except:
+                        pass
 
-                    # Mesajı silme işlemini ayrı task olarak çalıştır
-                    async def delete_later(msg):
-                        await asyncio.sleep(60)
-                        try:
-                            await msg.delete()
-                        except:
-                            pass
-
-                    asyncio.create_task(delete_later(reply_msg))
-
-            except:
-                await message.channel.send(f"{user.mention}, DM gönderilemedi.")
-
+                asyncio.create_task(delete_later(reply_msg))
+    finally:
+        if key in active_reactions:
             active_reactions.remove(key)
 
 # ------------------------------
-# RAW REACTION EVENT (ESKİ VE YENİ MESAJLAR)
+# RAW REACTION EVENT
 # ------------------------------
 @bot.event
 async def on_raw_reaction_add(payload):
@@ -177,10 +224,11 @@ async def on_raw_reaction_add(payload):
     except:
         return
 
-    await process_message_reactions(message, user)
+    emoji_str = str(payload.emoji)
+    await process_message_reactions(message, user, emoji_str)
 
 # ------------------------------
-# KOMUTLAR: Kanal / Kategori Ayarları
+# KOMUTLAR
 # ------------------------------
 @bot.command()
 async def setchannel(ctx, channel: discord.TextChannel, active: str, send_dm: str):
@@ -208,9 +256,21 @@ async def setcategory(ctx, category: discord.CategoryChannel, active: str, send_
     save_channel_config(config_data)
     await ctx.send(f"{category.name} kategorisi için çeviri ayarlandı: Active={active_bool}, DM={send_dm_bool}")
 
-# ------------------------------
-# DİĞER KOMUTLAR
-# ------------------------------
+@bot.command()
+async def addowner(ctx, user: discord.User):
+    if ctx.author.id not in OWNER_IDS:
+        await ctx.send("🚫 Bu komutu sadece mevcut sahipler kullanabilir.")
+        return
+
+    if user.id in OWNER_IDS:
+        await ctx.send(f"{user.name} zaten whitelist'te.")
+        return
+
+    OWNER_IDS.append(user.id)
+    with open("whitelist.json", "w", encoding="utf-8") as f:
+        json.dump({"owners": OWNER_IDS}, f, indent=4)
+    await ctx.send(f"✅ {user.name} whitelist'e eklendi.")
+
 @bot.command()
 async def ping(ctx):
     await ctx.send("🏓 Pong! Bot çalışıyor.")
@@ -223,6 +283,7 @@ async def help(ctx):
 `-ping` → Botun çalışıp çalışmadığını test eder  
 `-setchannel #kanal aktif/dm` → Kanal için çeviri ayarı yapar  
 `-setcategory #kategori aktif/dm` → Kategori için çeviri ayarı yapar  
+`-addowner @kullanıcı` → Whitelist'e yeni kullanıcı ekler  
 `-help` → Bu mesajı gösterir
 """
     msg = await ctx.send(f"{ctx.author.mention}\n{help_text}")
